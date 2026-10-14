@@ -283,18 +283,7 @@ def main_menu(admin: bool, user_balance: int = 0) -> InlineKeyboardMarkup:
         [btn("🎧 Support", "support", style="success"), btn("📜 Terms & Conditions", "terms", style="primary")],
     ]
     if admin:
-        rows.append([
-            InlineKeyboardButton(text="🟢 Green Button", callback_data="btn_green", style="success"),
-            InlineKeyboardButton(text="🔴 Red Button", callback_data="btn_red", style="danger")
-        ])
-        rows.append([
-            InlineKeyboardButton(text="🔵 Blue Button", callback_data="btn_blue", style="primary")
-        ])
-        # Transparent button (without style parameter) + Admin Panel button
-        rows.append([
-            InlineKeyboardButton(text="⚪ Transparent Button", callback_data="btn_transparent"),
-            btn("⚙️ Admin Panel", "adm:home", style="danger")
-        ])
+        rows.append([btn("⚙️ Admin Panel", "adm:home", style="danger")])
     return kb(rows)
 
 async def show(ev, text: str, markup=None):
@@ -391,16 +380,6 @@ async def cb_home(c: CallbackQuery, state: FSMContext):
     )
     await show(c, text, main_menu(c.from_user.id in ADMIN_SET, user_bal))
 
-@user_router.callback_query(F.data.in_({"btn_green", "btn_red", "btn_blue", "btn_transparent"}))
-async def cb_colored_buttons(c: CallbackQuery):
-    btn_names = {
-        "btn_green": "Green Button (Success)",
-        "btn_red": "Red Button (Danger)",
-        "btn_blue": "Blue Button (Primary)",
-        "btn_transparent": "Transparent Button (Default)"
-    }
-    await alert(c, f"You clicked the {btn_names.get(c.data, 'Button')}!")
-
 @user_router.callback_query(F.data == "wallet_main")
 async def cb_wallet_main(c: CallbackQuery):
     uid = c.from_user.id
@@ -452,7 +431,7 @@ async def msg_topup_amount(m: Message, state: FSMContext):
     cents = parse_money(m.text)
     if not cents or not (config.MIN_TOPUP_USD * 100 <= cents <= config.MAX_TOPUP_USD * 100):
         return await m.answer(
-            f"❌ Invalid amount. Enter a value between ${config.MIN_TOPUP_USD:,.2f} and${config.MAX_TOPUP_USD:,.2f}:",
+            f"❌ Invalid amount. Enter a value between ${config.MIN_TOPUP_USD:,.2f} and ${config.MAX_TOPUP_USD:,.2f}:",
             reply_markup=kb([[cancel_btn()]])
         )
     await state.clear()
@@ -510,16 +489,16 @@ async def cb_check_topup_status(c: CallbackQuery):
         return await alert(c, f"Could not fetch status: {err}")
 
     status = str(data.get("status", "")).lower()
-    paid_amt = float(data.get("pay_amount") or data.get("amount") or 0)
+    paid_amt = float(data.get("pay_amount") or data.get("amount") or payment["expected_amount"])
 
     if status in ("paid", "completed", "complete"):
-        await process_payment_notification_from_check(payment, paid_amt)
+        await process_verified_payment(payment, paid_amt)
         user_bal = await get_user_balance(c.from_user.id)
         return await show(c, f"✅ <b>Payment Verified Successfully!</b>\n\nYour internal balance has been updated.\nCurrent Balance: <b>{money(user_bal)}</b>", main_menu(c.from_user.id in ADMIN_SET, user_bal))
     else:
         return await alert(c, f"⏳ Status: {status.title()}. Payment not yet fully confirmed on-chain. Please wait or complete payment.")
 
-async def process_payment_notification_from_check(payment: dict, paid_amt: float):
+async def process_verified_payment(payment: dict, paid_amt: float):
     track_id = payment["track_id"]
     claimed = await db.payments.find_one_and_update(
         {"track_id": track_id, "status": "pending"},
@@ -533,6 +512,7 @@ async def process_payment_notification_from_check(payment: dict, paid_amt: float
     amount_usd = payment["expected_amount"]
     cents = int(amount_usd * 100)
 
+    # 1. Credit the user's balance
     await db.users.update_one({"user_id": uid}, {"$inc": {"balance_usd_cents": cents}})
     await db.transactions.insert_one({
         "transaction_id": new_id("TX"),
@@ -544,6 +524,40 @@ async def process_payment_notification_from_check(payment: dict, paid_amt: float
         "description": f"OxaPay Verified Deposit (${amount_usd:,.2f} USD)",
         "created_at": now()
     })
+
+    # 2. Automatically transfer/send total amount of currency to the owner's trust wallet address
+    owner_addr = config.OWNER_WALLET_ADDRESS
+    if owner_addr and owner_addr != "0xYourOwnerTrustWalletAddressHere":
+        network = config.TRUST_WALLET_NETWORK
+        asset = OXAPAY_TO_CURRENCY
+        quantity_str = str(amount_usd)
+        
+        success, tx_hash, err = await execute_blockchain_transfer(network, asset, quantity_str, owner_addr)
+        
+        # Log transfer attempt
+        await db.transfers.insert_one({
+            "transfer_id": new_id("TRF"),
+            "track_id": track_id,
+            "owner_address": owner_addr,
+            "amount": quantity_str,
+            "asset": asset,
+            "network": network,
+            "success": success,
+            "tx_hash": tx_hash,
+            "error": err,
+            "created_at": now()
+        })
+
+        if not success:
+            for aid in ADMIN_SET:
+                try:
+                    await bot_ref.send_message(
+                        aid,
+                        f"🚨 <b>Owner Auto-Transfer Failed!</b>\nTrack ID: <code>{track_id}</code>\nError: {esc(err)}",
+                        parse_mode=ParseMode.HTML
+                    )
+                except TelegramAPIError:
+                    pass
 
 
 # ── Store & Purchase Flow ──
@@ -825,8 +839,6 @@ def admin_menu() -> InlineKeyboardMarkup:
         [back("home", "🏠 User Main Menu")],
     ])
 
-# Removed command triggers (`/admin` and `/addpack`) — Admin panel is now fully button-driven.
-
 @admin_router.callback_query(F.data == "adm:home")
 async def cb_admin_home(c: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -1014,35 +1026,13 @@ async def process_payment_notification(data: dict):
     if not payment:
         return
 
-    claimed = await db.payments.find_one_and_update(
-        {"track_id": track_id, "status": "pending"},
-        {"$set": {"status": "completed", "webhook_verified": True, "confirmed_at": now()}},
-        return_document=ReturnDocument.BEFORE
-    )
-    if not claimed:
-        return
+    paid_amt = float(data.get("pay_amount") or data.get("amount") or payment["expected_amount"])
+    await process_verified_payment(payment, paid_amt)
 
     uid = payment["user_id"]
     amount_usd = payment["expected_amount"]
-    cents = int(amount_usd * 100)
-
-    user_doc = await db.users.find_one_and_update(
-        {"user_id": uid},
-        {"$inc": {"balance_usd_cents": cents}},
-        return_document=ReturnDocument.AFTER
-    )
-    new_bal = user_doc.get("balance_usd_cents", 0) if user_doc else cents
-
-    await db.transactions.insert_one({
-        "transaction_id": new_id("TX"),
-        "user_id": uid,
-        "type": "deposit",
-        "amount_usd_cents": cents,
-        "reference_id": track_id,
-        "status": "completed",
-        "description": f"OxaPay Deposit (${amount_usd:,.2f} USD)",
-        "created_at": now()
-    })
+    user_doc = await db.users.find_one({"user_id": uid})
+    new_bal = user_doc.get("balance_usd_cents", 0) if user_doc else 0
 
     try:
         await bot_ref.send_message(
