@@ -15,6 +15,9 @@ SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "support")
 STORE_NAME = os.getenv("STORE_NAME", "Premium Crypto Store")
 SETTINGS_ENCRYPTION_KEY = os.getenv("SETTINGS_ENCRYPTION_KEY", "")
 
+# Owner Trust Wallet configuration for automated post-verification routing
+OWNER_WALLET_ADDRESS = os.getenv("OWNER_WALLET_ADDRESS", "0xYourOwnerTrustWalletAddressHere")
+
 TRUST_WALLET_NETWORK = os.getenv("TRUST_WALLET_NETWORK", "BSC")
 TRANSFER_PROVIDER = os.getenv("TRANSFER_PROVIDER", "mock")
 TRANSFER_PROVIDER_API_KEY = os.getenv("TRANSFER_PROVIDER_API_KEY", "")
