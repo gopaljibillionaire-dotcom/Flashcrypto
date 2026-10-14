@@ -158,13 +158,8 @@ async def create_oxapay_invoice(user_id: int, amount_usd: float, order_ref: str)
 # ════════════════════════ TRANSFER PROVIDER ABSTRACTION ════════════════════════
 
 async def execute_blockchain_transfer(network: str, asset: str, quantity: str, destination_address: str) -> tuple[bool, str, str]:
-    """
-    Interfaces with the configured transfer provider API to deliver real on-chain assets.
-    Returns (success, tx_hash_or_ref, error_message).
-    """
     provider = config.TRANSFER_PROVIDER.lower()
     if provider == "mock" or not config.TRANSFER_PROVIDER_BASE_URL:
-        # Secure simulation mode for testnet/sandbox verification
         if config.OXAPAY_SANDBOX:
             await asyncio.sleep(1)
             return True, f"0xTESTHASH{secrets.token_hex(16).upper()}", ""
@@ -215,7 +210,6 @@ async def init_db():
     await db.settings.create_index("key", unique=True)
     await db.admin_audit_logs.create_index([("created_at", D)])
 
-    # Seed default sample packages if none exist
     if await db.packs.count_documents({}) == 0:
         default_packs = [
             {
@@ -223,12 +217,12 @@ async def init_db():
                 "asset": "USDT",
                 "network": "BSC",
                 "quantity": "10000",
-                "price_usd_cents": 10000,
+                "price_usd_cents": 1000000, # $10,000.00
                 "inventory_available": 50,
                 "provider": "default",
                 "active": True,
-                "title": "USDT Pack 10K",
-                "description": "10,000 USDT deliverable on BNB Smart Chain.",
+                "title": "USDT Flash Pack 10K",
+                "description": "10,000 USDT deliverable instantly on BNB Smart Chain.",
                 "created_at": now()
             },
             {
@@ -236,11 +230,11 @@ async def init_db():
                 "asset": "BTC",
                 "network": "Bitcoin",
                 "quantity": "0.1",
-                "price_usd_cents": 65000,
+                "price_usd_cents": 6500000, # $65,000.00
                 "inventory_available": 10,
                 "provider": "default",
                 "active": True,
-                "title": "Bitcoin Pack 0.1 BTC",
+                "title": "Bitcoin Flash Pack 0.1 BTC",
                 "description": "0.1 BTC deliverable on Bitcoin Network.",
                 "created_at": now()
             }
@@ -268,6 +262,8 @@ def btn(text: str, cb: Optional[str] = None, style: Optional[str] = None, url: O
         kw["url"] = url
     else:
         kw["callback_data"] = cb
+    if style:
+        kw["style"] = style
     return InlineKeyboardButton(**kw)
 
 def kb(rows: list) -> InlineKeyboardMarkup:
@@ -281,13 +277,24 @@ def cancel_btn(cb: str = "home"):
 
 def main_menu(admin: bool, user_balance: int = 0) -> InlineKeyboardMarkup:
     rows = [
-        [btn("🛍 Buy Crypto Packs", "store:list:0", "success")],
-        [btn("👛 My Wallet", "wallet_main", "success"), btn("➕ Top Up Balance", "topup_prompt", "success")],
-        [btn("📦 My Orders", "orders:0", "primary"), btn("💳 Transactions", "tx:0", "primary")],
-        [btn("🎧 Support", "support", "success"), btn("📜 Terms & Conditions", "terms", "primary")],
+        [btn("🛍 Buy Crypto Packs", "store:list:0", style="success")],
+        [btn("👛 My Wallet", "wallet_main", style="success"), btn("➕ Top Up Balance", "topup_prompt", style="success")],
+        [btn("📦 My Orders", "orders:0", style="primary"), btn("💳 Transactions", "tx:0", style="primary")],
+        [btn("🎧 Support", "support", style="success"), btn("📜 Terms & Conditions", "terms", style="primary")],
     ]
     if admin:
-        rows.append([btn("⚙️ Admin Panel", "adm:home", "danger")])
+        rows.append([
+            InlineKeyboardButton(text="🟢 Green Button", callback_data="btn_green", style="success"),
+            InlineKeyboardButton(text="🔴 Red Button", callback_data="btn_red", style="danger")
+        ])
+        rows.append([
+            InlineKeyboardButton(text="🔵 Blue Button", callback_data="btn_blue", style="primary")
+        ])
+        # Transparent button (without style parameter) + Admin Panel button
+        rows.append([
+            InlineKeyboardButton(text="⚪ Transparent Button", callback_data="btn_transparent"),
+            btn("⚙️ Admin Panel", "adm:home", style="danger")
+        ])
     return kb(rows)
 
 async def show(ev, text: str, markup=None):
@@ -347,6 +354,7 @@ class AdminStates(StatesGroup):
     pack_qty = State()
     pack_price = State()
     pack_inventory = State()
+    pack_desc = State()
     balance_user_id = State()
     balance_amount = State()
     balance_reason = State()
@@ -383,6 +391,16 @@ async def cb_home(c: CallbackQuery, state: FSMContext):
     )
     await show(c, text, main_menu(c.from_user.id in ADMIN_SET, user_bal))
 
+@user_router.callback_query(F.data.in_({"btn_green", "btn_red", "btn_blue", "btn_transparent"}))
+async def cb_colored_buttons(c: CallbackQuery):
+    btn_names = {
+        "btn_green": "Green Button (Success)",
+        "btn_red": "Red Button (Danger)",
+        "btn_blue": "Blue Button (Primary)",
+        "btn_transparent": "Transparent Button (Default)"
+    }
+    await alert(c, f"You clicked the {btn_names.get(c.data, 'Button')}!")
+
 @user_router.callback_query(F.data == "wallet_main")
 async def cb_wallet_main(c: CallbackQuery):
     uid = c.from_user.id
@@ -414,17 +432,17 @@ async def cb_wallet_main(c: CallbackQuery):
         f"• Total Spent: <b>{money(total_spent)}</b>\n\n"
         f"<b>Recent Transactions:</b>\n{tx_str}"
     )
-    await show(c, text, kb([[btn("➕ Top Up Balance", "topup_prompt", "success")], [back()]]))
+    await show(c, text, kb([[btn("➕ Top Up Balance", "topup_prompt", style="success")], [back()]]))
 
 
-# ── Top-Up Flow ──
+# ── Top-Up Flow with OxaPay & Status Checking ──
 
 @user_router.callback_query(F.data == "topup_prompt")
 async def cb_topup_prompt(c: CallbackQuery, state: FSMContext):
     await state.clear()
     await state.set_state(TopUpStates.amount)
     text = (
-        f"➕ <b>Top Up Balance</b>\n\n"
+        f"➕ <b>Top Up Balance via OxaPay</b>\n\n"
         f"Enter deposit amount in USD (Limits: ${config.MIN_TOPUP_USD:,.2f} - ${config.MAX_TOPUP_USD:,.2f}):"
     )
     await show(c, text, kb([[cancel_btn()]]))
@@ -434,7 +452,7 @@ async def msg_topup_amount(m: Message, state: FSMContext):
     cents = parse_money(m.text)
     if not cents or not (config.MIN_TOPUP_USD * 100 <= cents <= config.MAX_TOPUP_USD * 100):
         return await m.answer(
-            f"❌ Invalid amount. Enter a value between ${config.MIN_TOPUP_USD:,.2f} and ${config.MAX_TOPUP_USD:,.2f}:",
+            f"❌ Invalid amount. Enter a value between ${config.MIN_TOPUP_USD:,.2f} and${config.MAX_TOPUP_USD:,.2f}:",
             reply_markup=kb([[cancel_btn()]])
         )
     await state.clear()
@@ -469,9 +487,63 @@ async def msg_topup_amount(m: Message, state: FSMContext):
         f"🧾 <b>OxaPay Invoice Created</b>\n\n"
         f"Amount: <b>${usd_val:,.2f} USD</b>\n"
         f"Reference: <code>{order_ref}</code>\n\n"
-        "Click below to complete secure crypto payment:"
+        "Click below to complete crypto payment, then tap <b>'I have paid / Check Status'</b> to verify:"
     )
-    await m.answer(text, reply_markup=kb([[btn("💳 Pay via OxaPay", url=pay_url, style="success")], [back()]]), parse_mode=ParseMode.HTML)
+    await m.answer(text, reply_markup=kb([
+        [btn("💳 Pay via OxaPay", url=pay_url, style="success")],
+        [btn("🔄 I have paid / Check Status", f"topup:check:{track_id}", style="primary")],
+        [back()]
+    ]), parse_mode=ParseMode.HTML)
+
+@user_router.callback_query(F.data.startswith("topup:check:"))
+async def cb_check_topup_status(c: CallbackQuery):
+    track_id = c.data.split(":")[2]
+    payment = await db.payments.find_one({"track_id": track_id})
+    if not payment:
+        return await alert(c, "Payment record not found.")
+
+    if payment["status"] == "completed":
+        return await alert(c, "✅ Payment already verified and credited to your balance!")
+
+    data, err = await fetch_payment_info(track_id)
+    if not data:
+        return await alert(c, f"Could not fetch status: {err}")
+
+    status = str(data.get("status", "")).lower()
+    paid_amt = float(data.get("pay_amount") or data.get("amount") or 0)
+
+    if status in ("paid", "completed", "complete"):
+        await process_payment_notification_from_check(payment, paid_amt)
+        user_bal = await get_user_balance(c.from_user.id)
+        return await show(c, f"✅ <b>Payment Verified Successfully!</b>\n\nYour internal balance has been updated.\nCurrent Balance: <b>{money(user_bal)}</b>", main_menu(c.from_user.id in ADMIN_SET, user_bal))
+    else:
+        return await alert(c, f"⏳ Status: {status.title()}. Payment not yet fully confirmed on-chain. Please wait or complete payment.")
+
+async def process_payment_notification_from_check(payment: dict, paid_amt: float):
+    track_id = payment["track_id"]
+    claimed = await db.payments.find_one_and_update(
+        {"track_id": track_id, "status": "pending"},
+        {"$set": {"status": "completed", "webhook_verified": True, "confirmed_at": now()}},
+        return_document=ReturnDocument.BEFORE
+    )
+    if not claimed:
+        return
+
+    uid = payment["user_id"]
+    amount_usd = payment["expected_amount"]
+    cents = int(amount_usd * 100)
+
+    await db.users.update_one({"user_id": uid}, {"$inc": {"balance_usd_cents": cents}})
+    await db.transactions.insert_one({
+        "transaction_id": new_id("TX"),
+        "user_id": uid,
+        "type": "deposit",
+        "amount_usd_cents": cents,
+        "reference_id": track_id,
+        "status": "completed",
+        "description": f"OxaPay Verified Deposit (${amount_usd:,.2f} USD)",
+        "created_at": now()
+    })
 
 
 # ── Store & Purchase Flow ──
@@ -487,7 +559,7 @@ async def cb_store_list(c: CallbackQuery):
     if not packs:
         return await show(c, "🛍 <b>Crypto Pack Store</b>\n\nNo packages currently available.", kb([[back()]]))
 
-    rows = [[btn(f"{p['title']} — {money(p['price_usd_cents'])}", f"pack:view:{p['pack_id']}", "success")] for p in packs]
+    rows = [[btn(f"{p['title']} — {money(p['price_usd_cents'])}", f"pack:view:{p['pack_id']}", style="success")] for p in packs]
     
     pager_row = []
     if page > 0:
@@ -520,7 +592,7 @@ async def cb_pack_view(c: CallbackQuery):
         "✅ Delivery involves genuine, transferable on-chain assets."
     )
     rows = [
-        [btn("🛒 Proceed to Purchase", f"pack:buy:{pack_id}", "success")],
+        [btn("🛒 Proceed to Purchase", f"pack:buy:{pack_id}", style="success")],
         [back("store:list:0", "⬅️ Back to Store")]
     ]
     await show(c, text, kb(rows))
@@ -537,7 +609,14 @@ async def cb_pack_buy(c: CallbackQuery, state: FSMContext):
     price = p["price_usd_cents"]
 
     if user_bal < price:
-        return await alert(c, f"❌ Insufficient balance. You have {money(user_bal)}, but need {money(price)}. Please top up.")
+        return await show(
+            c,
+            f"❌ <b>Insufficient Store Balance</b>\n\n"
+            f"Required: <b>{money(price)}</b>\n"
+            f"Your Balance: <b>{money(user_bal)}</b>\n\n"
+            f"Please top up your balance first to purchase this package.",
+            kb([[btn("➕ Top Up Balance", "topup_prompt", style="success")], [back(f"pack:view:{pack_id}", "⬅️ Back to Package")]])
+        )
 
     await state.update_data(pack_id=pack_id)
     await state.set_state(CheckoutStates.wallet_address)
@@ -547,7 +626,7 @@ async def cb_pack_buy(c: CallbackQuery, state: FSMContext):
         f"Selected Package: <b>{esc(p['title'])}</b>\n"
         f"Network: <b>{esc(p['network'])}</b>\n"
         f"Asset: <b>{esc(p['asset'])}</b>\n\n"
-        f"Please send the valid <b>{esc(p['network'])}</b> wallet address where assets should be delivered.\n\n"
+        f"Please send the valid <b>{esc(p['network'])}</b> Trust Wallet or destination address where assets should be delivered.\n\n"
         "⚠️ <i>Ensure the address supports this network. Incorrect networks result in permanent loss. Never submit private keys or seed phrases.</i>"
     )
     await show(c, text, kb([[cancel_btn()]]))
@@ -574,7 +653,7 @@ async def msg_wallet_address(m: Message, state: FSMContext):
         "Tap confirm below to authorize atomic deduction and initiate transfer."
     )
     await m.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb([
-        [btn("✅ Confirm & Deliver", "checkout_execute", "success")],
+        [btn("✅ Confirm & Send to Wallet", "checkout_execute", style="success")],
         [cancel_btn()]
     ]))
 
@@ -592,7 +671,6 @@ async def cb_checkout_execute(c: CallbackQuery, state: FSMContext):
 
     price = p["price_usd_cents"]
 
-    # Atomic Balance Deduction & Inventory Decrement
     user_upd = await db.users.find_one_and_update(
         {"user_id": uid, "balance_usd_cents": {"$gte": price}},
         {"$inc": {"balance_usd_cents": -price}},
@@ -607,7 +685,6 @@ async def cb_checkout_execute(c: CallbackQuery, state: FSMContext):
         return_document=ReturnDocument.AFTER
     )
     if not pack_upd:
-        # Rollback balance if inventory depleted simultaneously
         await db.users.update_one({"user_id": uid}, {"$inc": {"balance_usd_cents": price}})
         return await show(c, "❌ Out of stock during checkout. Balance refunded.", kb([[back()]]))
 
@@ -630,7 +707,6 @@ async def cb_checkout_execute(c: CallbackQuery, state: FSMContext):
     }
     await db.orders.insert_one(order_doc)
 
-    # Initiate real on-chain transfer via provider abstraction
     success, tx_hash, err = await execute_blockchain_transfer(p["network"], p["asset"], p["quantity"], dest_addr)
 
     if success:
@@ -649,7 +725,7 @@ async def cb_checkout_execute(c: CallbackQuery, state: FSMContext):
             "created_at": now()
         })
         text = (
-            f"✅ <b>Order Successfully Delivered!</b>\n\n"
+            f"✅ <b>Order Successfully Delivered to Wallet!</b>\n\n"
             f"Order ID: <code>{order_id}</code>\n"
             f"Asset: <b>{esc(p['quantity'])} {esc(p['asset'])}</b>\n"
             f"Network: <b>{esc(p['network'])}</b>\n"
@@ -657,23 +733,25 @@ async def cb_checkout_execute(c: CallbackQuery, state: FSMContext):
             f"Tx Hash: <code>{esc(tx_hash)}</code>"
         )
     else:
-        # Recoverable pending state & audit alert
         await db.orders.update_one(
             {"order_id": order_id},
             {"$set": {"status": "pending_delivery_reconciliation", "updated_at": now()}}
         )
         text = (
-            f"⚠️ <b>Order Placed, Delivery Pending Reconciliation</b>\n\n"
+            f"⚠️ <b>Order Placed, Transfer Pending Reconciliation</b>\n\n"
             f"Order ID: <code>{order_id}</code>\n"
-            f"Your payment was processed, but the transfer provider returned a delay: {esc(err)}\n"
-            "Our admin team has been alerted to reconcile your transfer manually."
+            f"Payment verified, but automated transfer provider reported: {esc(err)}\n"
+            "Our admin team has been alerted to review and push your on-chain assets manually."
         )
         for aid in ADMIN_SET:
-            await bot_ref.send_message(
-                aid,
-                f"🚨 <b>Transfer Failure Alert</b>\nOrder: <code>{order_id}</code>\nUser: <code>{uid}</code>\nError: {esc(err)}",
-                parse_mode=ParseMode.HTML
-            )
+            try:
+                await bot_ref.send_message(
+                    aid,
+                    f"🚨 <b>Transfer Failure Alert</b>\nOrder: <code>{order_id}</code>\nUser: <code>{uid}</code>\nError: {esc(err)}",
+                    parse_mode=ParseMode.HTML
+                )
+            except TelegramAPIError:
+                pass
 
     await show(c, text, kb([[back()]]))
 
@@ -689,7 +767,7 @@ async def cb_orders(c: CallbackQuery):
     if not total:
         return await show(c, "📦 <b>My Orders</b>\n\nNo orders found.", kb([[back()]]))
 
-    rows = [[btn(f"{o['order_id']} • {money(o['price_usd_cents'])} • {o['status'].title()}", f"order:view:{o['order_id']}", "primary")] for o in orders]
+    rows = [[btn(f"{o['order_id']} • {money(o['price_usd_cents'])} • {o['status'].title()}", f"order:view:{o['order_id']}", style="primary")] for o in orders]
     rows.append([back()])
     await show(c, f"📦 <b>My Orders</b> ({total})", kb(rows))
 
@@ -718,7 +796,7 @@ async def cb_transactions(c: CallbackQuery):
     uid = c.from_user.id
     total = await db.transactions.count_documents({"user_id": uid})
     txs = await db.transactions.find({"user_id": uid}).sort("created_at", -1).skip(page * PAGE_SIZE).limit(PAGE_SIZE).to_list(PAGE_SIZE)
-    rows = [[btn(f"{t['description']} — {money(t['amount_usd_cents'])}", "noop", "primary")] for t in txs]
+    rows = [[btn(f"{t['description']} — {money(t['amount_usd_cents'])}", "noop", style="primary")] for t in txs]
     rows.append([back()])
     await show(c, f"💳 <b>Transaction History</b> ({total})", kb(rows))
 
@@ -737,25 +815,107 @@ async def cb_noop(c: CallbackQuery):
     await c.answer()
 
 
-# ════════════════════════ ADMIN PANEL ════════════════════════
+# ════════════════════════ ADMIN PANEL & PACK CREATOR WIZARD ════════════════════════
 
 def admin_menu() -> InlineKeyboardMarkup:
     return kb([
-        [btn("➕ Add Crypto Pack", "adm:pack_add", "success"), btn("📦 Manage Packs", "adm:packs:0", "primary")],
-        [btn("📋 Active Orders", "adm:orders:processing", "success"), btn("✅ Completed Orders", "adm:orders:completed", "primary")],
-        [btn("⚖️ Adjust User Balance", "adm:bal_prompt", "success"), btn("📊 Revenue & Stats", "adm:stats", "primary")],
+        [btn("➕ Add Crypto Pack", "adm:pack_add", style="success"), btn("📦 Manage Packs", "adm:packs:0", style="primary")],
+        [btn("📋 Active Orders", "adm:orders:processing", style="success"), btn("✅ Completed Orders", "adm:orders:completed", style="primary")],
+        [btn("⚖️ Adjust User Balance", "adm:bal_prompt", style="success"), btn("📊 Revenue & Stats", "adm:stats", style="primary")],
         [back("home", "🏠 User Main Menu")],
     ])
 
-@admin_router.message(Command("admin"))
-async def cmd_admin(m: Message, state: FSMContext):
-    await state.clear()
-    await m.answer("⚙️ <b>Admin Control Panel</b>", reply_markup=admin_menu(), parse_mode=ParseMode.HTML)
+# Removed command triggers (`/admin` and `/addpack`) — Admin panel is now fully button-driven.
 
 @admin_router.callback_query(F.data == "adm:home")
 async def cb_admin_home(c: CallbackQuery, state: FSMContext):
     await state.clear()
     await show(c, "⚙️ <b>Admin Control Panel</b>", admin_menu())
+
+# ── Pack Creator FSM Wizard ──
+
+@admin_router.callback_query(F.data == "adm:pack_add")
+async def cb_admin_pack_add(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(AdminStates.pack_title)
+    await show(c, "➕ <b>Add New Crypto Pack</b>\n\nEnter package title (e.g., <i>Bitcoin Mega Pack 0.5 BTC</i>):", kb([[cancel_btn("adm:home")]]))
+
+@admin_router.message(AdminStates.pack_title, F.text)
+async def msg_pack_title(m: Message, state: FSMContext):
+    await state.update_data(pack_title=m.text.strip())
+    await state.set_state(AdminStates.pack_asset)
+    await m.answer("Enter cryptocurrency asset symbol (e.g., <code>BTC</code>, <code>ETH</code>, <code>USDT</code>, <code>SOL</code>, <code>LTC</code>):", parse_mode=ParseMode.HTML, reply_markup=kb([[cancel_btn("adm:home")]]))
+
+@admin_router.message(AdminStates.pack_asset, F.text)
+async def msg_pack_asset(m: Message, state: FSMContext):
+    await state.update_data(pack_asset=m.text.strip().upper())
+    await state.set_state(AdminStates.pack_network)
+    await m.answer("Enter blockchain network (e.g., <code>Bitcoin</code>, <code>Ethereum</code>, <code>BSC</code>, <code>Polygon</code>, <code>Solana</code>):", parse_mode=ParseMode.HTML, reply_markup=kb([[cancel_btn("adm:home")]]))
+
+@admin_router.message(AdminStates.pack_network, F.text)
+async def msg_pack_network(m: Message, state: FSMContext):
+    await state.update_data(pack_network=m.text.strip())
+    await state.set_state(AdminStates.pack_qty)
+    await m.answer("Enter asset quantity to deliver per purchase (e.g., <code>0.5</code> or <code>10000</code>):", parse_mode=ParseMode.HTML, reply_markup=kb([[cancel_btn("adm:home")]]))
+
+@admin_router.message(AdminStates.pack_qty, F.text)
+async def msg_pack_qty(m: Message, state: FSMContext):
+    await state.update_data(pack_qty=m.text.strip())
+    await state.set_state(AdminStates.pack_price)
+    await m.answer("Enter price of this pack in USD dollars (e.g., <code>1500.00</code>):", parse_mode=ParseMode.HTML, reply_markup=kb([[cancel_btn("adm:home")]]))
+
+@admin_router.message(AdminStates.pack_price, F.text)
+async def msg_pack_price(m: Message, state: FSMContext):
+    cents = parse_money(m.text)
+    if not cents:
+        return await m.answer("❌ Invalid price amount. Re-enter USD price:", reply_markup=kb([[cancel_btn("adm:home")]]))
+    await state.update_data(price_cents=cents)
+    await state.set_state(AdminStates.pack_inventory)
+    await m.answer("Enter initial inventory stock count (e.g., <code>25</code>):", reply_markup=kb([[cancel_btn("adm:home")]]))
+
+@admin_router.message(AdminStates.pack_inventory, F.text)
+async def msg_pack_inventory(m: Message, state: FSMContext):
+    inv = to_int(m.text.strip())
+    if inv <= 0:
+        return await m.answer("❌ Invalid stock count. Enter a positive number:", reply_markup=kb([[cancel_btn("adm:home")]]))
+    await state.update_data(inventory=inv)
+    await state.set_state(AdminStates.pack_desc)
+    await m.answer("Enter marketing description or instructions for the buyer:", reply_markup=kb([[cancel_btn("adm:home")]]))
+
+@admin_router.message(AdminStates.pack_desc, F.text)
+async def msg_pack_desc(m: Message, state: FSMContext):
+    desc = m.text.strip()
+    data = await state.get_data()
+    await state.clear()
+
+    pack_id = f"PACK-{data['pack_asset']}-{secrets.token_hex(3).upper()}"
+    pack_doc = {
+        "pack_id": pack_id,
+        "title": data["pack_title"],
+        "asset": data["pack_asset"],
+        "network": data["pack_network"],
+        "quantity": data["pack_qty"],
+        "price_usd_cents": data["price_cents"],
+        "inventory_available": data["inventory"],
+        "description": desc,
+        "active": True,
+        "created_at": now()
+    }
+    await db.packs.insert_one(pack_doc)
+
+    await m.answer(
+        f"✅ <b>Crypto Package Created Successfully!</b>\n\n"
+        f"• ID: <code>{pack_id}</code>\n"
+        f"• Title: <b>{esc(data['pack_title'])}</b>\n"
+        f"• Asset: <b>{esc(data['pack_qty'])} {esc(data['pack_asset'])}</b> on {esc(data['pack_network'])}\n"
+        f"• Price: <b>{money(data['price_cents'])}</b>\n"
+        f"• Stock: <b>{data['inventory']} units</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb([[btn("⚙️ Admin Menu", "adm:home", style="primary")]])
+    )
+
+
+# ── Admin Stats ──
 
 @admin_router.callback_query(F.data == "adm:stats")
 async def cb_admin_stats(c: CallbackQuery):
@@ -847,14 +1007,13 @@ def verify_oxapay_hmac(body_bytes: bytes, hmac_header: Optional[str]) -> bool:
 async def process_payment_notification(data: dict):
     track_id = str(data.get("track_id") or data.get("trackId") or "")
     status = str(data.get("status", "")).strip().lower()
-    if not track_id or status not in ("paid", "completed"):
+    if not track_id or status not in ("paid", "completed", "complete"):
         return
 
     payment = await db.payments.find_one({"track_id": track_id, "status": "pending"})
     if not payment:
         return
 
-    # Atomic credit completion
     claimed = await db.payments.find_one_and_update(
         {"track_id": track_id, "status": "pending"},
         {"$set": {"status": "completed", "webhook_verified": True, "confirmed_at": now()}},
